@@ -1,0 +1,74 @@
+[build-system]
+requires = ["pyinstaller>=6", "setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitforge"
+version = "0.1.0"
+description = "1-bit quantization toolkit with GUI for mobile deployment"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+  { name = "BitForge" },
+]
+keywords = ["quantization", "1-bit", "binary-neural-network", "tinyML", "mobile"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.0",
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic",
+  "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "playwright>=1.45",
+]
+gui = [
+  "requests",
+  "pywebview",
+]
+mcp = [
+  "mcp>=1.0",
+  "pywin32",
+]
+
+[project.scripts]
+bitforge = "bitforge.cli:main"
+bitforge-api = "bitforge.run_api:main"
+bitforge-mcp = "bitforge.mcp_server:main"
+bitforge-verify = "bitforge.verify:main"
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+
+[tool.setuptools.package-data]
+bitforge = ["../README.md", "../LICENSE", "../docs/*", "../scripts/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
+filterwarnings = [
+  "ignore::DeprecationWarning:torch.jit._script",
+  "ignore::UserWarning:torch.onnx",
+  "ignore::UserWarning:torch.export._unlift",
+  "ignore::FutureWarning:copyreg",
+]
+
+[tool.pyinstaller]
+name = "BitForge"
+entry = "launcher/app.py"
+icon = "tauri-gui/src-tauri/icons/icon.ico"
+console = false
+onefile = true
+add_data = ["tauri-gui/dist:tauri-gui/dist"]
