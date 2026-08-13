@@ -21,8 +21,9 @@ class _LayerStatsCollector:
     def add(self, name, original, original_weight, quantized_weight, scale):
         original_bytes = int(original_weight.numel()) * original_weight.element_size()
         if hasattr(quantized_weight, "packed_weight"):
-            q_bytes = quantized_weight.packed_weight.numel() // 8
-        elif hasattr(quantized_weight, "dtype") and quantized_weight.dtype == torch.bool:
+            pw = quantized_weight.packed_weight
+            q_bytes = pw.numel() // 8 if pw.dtype in (torch.bool, torch.uint8) else pw.numel()
+        elif hasattr(quantized_weight, "dtype") and quantized_weight.dtype in (torch.bool, torch.uint8):
             q_bytes = quantized_weight.numel() // 8
         else:
             q_bytes = int(quantized_weight.numel()) * quantized_weight.element_size()
@@ -56,26 +57,29 @@ class _XNORLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size
-        self.register_buffer("packed_weight", torch.empty(out_features, in_features, dtype=torch.bool))
+        self.register_buffer("packed_weight", torch.empty(out_features, in_features, dtype=torch.uint8))
         self.register_buffer("scale", torch.empty(out_features, 1))
 
     @classmethod
     def from_linear(cls, module: nn.Linear, group_size=32, activation_scales=None):
         layer = cls(module.in_features, module.out_features, group_size)
-        w = module.weight.detach()
-        layer.packed_weight.data = w.sign() > 0
-
-        if group_size and group_size > 1:
-            groups = max(1, module.in_features // group_size)
-            scale = w.abs().reshape(module.out_features, groups, group_size).mean(dim=(1, 2))
-            layer.scale.data = scale.reshape(module.out_features, 1)
-        else:
-            layer.scale.data = w.abs().mean(dim=1, keepdim=True)
-
-        if activation_scales:
-            for name, val in activation_scales.items():
-                if name == module.__name__ if hasattr(module, "__name__") else False:
-                    layer.scale.data = layer.scale.data * val
+        w = module.weight.detach().sign() > 0
+        packed = torch.zeros_like(layer.packed_weight)
+        bits = 8
+        out_f, in_f = w.shape
+        for i in range(out_f):
+            packed_w = 0
+            for j in range(0, in_f, bits):
+                chunk = w[i, j:j+bits]
+                byte_val = 0
+                for b, bit in enumerate(chunk):
+                    if bit:
+                        byte_val |= 1 << (7 - b)
+                packed[i, j // bits] = byte_val
+        layer.packed_weight = packed
+        groups = max(1, in_f // group_size)
+        scale = module.weight.detach().abs().reshape(out_f, groups, group_size).mean(dim=(1, 2))
+        layer.scale = scale.reshape(out_f, 1)
         return layer
 
     def forward(self, x):
@@ -87,18 +91,22 @@ class _XNORLinear(nn.Module):
         return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
 
     def _forward_cpu(self, x):
-        import numpy as _np
+        if self.packed_weight.dtype != torch.uint8:
+            return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
+        import numpy as np
         x_np = x.detach().cpu().numpy()
-        if x_np.dtype != _np.float32:
-            x_np = x_np.astype(_np.float32)
-        x_bin = (x_np > 0).astype(_np.uint8)
+        x_bin = (x_np > 0).astype(np.uint8)
+        x_packed = np.packbits(x_bin, axis=-1)
         w = self.packed_weight.detach().cpu().numpy()
         groups = max(1, self.in_features // self.group_size)
-        x_g = x_bin.reshape(x_bin.shape[0], groups, self.group_size)
-        w_g = w.reshape(self.out_features, groups, self.group_size)
-        matches = _np.count_nonzero(x_g[:, None, :, :] == w_g[None, :, :, :], axis=-1)
-        signed = matches.astype(_np.float32) * 2 - self.group_size
-        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(_np.float32)
+        x_packed = x_packed.reshape(x_bin.shape[0], groups, self.group_size // 8)
+        w = w.reshape(self.out_features, groups, self.group_size // 8)
+        xor = np.bitwise_xor(x_packed[:, None, :, :], w[None, :, :, :])
+        lookup = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
+        mismatches = lookup[xor]
+        matches = (self.group_size - mismatches.sum(axis=-1)).astype(np.float32)
+        signed = matches * 2 - self.group_size
+        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(np.float32)
         out = (signed * s).sum(axis=-1)
         return torch.from_numpy(out).to(x)
 
@@ -108,15 +116,27 @@ class _BinarizeLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.register_buffer("packed_weight", torch.empty(out_features, in_features, dtype=torch.bool))
+        self.register_buffer("packed_weight", torch.empty(out_features, in_features, dtype=torch.uint8))
         self.register_buffer("scale", torch.empty(out_features, 1))
 
     @classmethod
     def from_linear(cls, module: nn.Linear, activation_scales=None, group_size=None):
         layer = cls(module.in_features, module.out_features)
-        w = module.weight.detach()
-        layer.packed_weight.data = w.sign() > 0
-        layer.scale.data = w.abs().mean(dim=1, keepdim=True)
+        w = module.weight.detach().sign() > 0
+        packed = torch.zeros_like(layer.packed_weight)
+        bits = 8
+        out_f, in_f = w.shape
+        for i in range(out_f):
+            packed_w = 0
+            for j in range(0, in_f, bits):
+                chunk = w[i, j:j+bits]
+                byte_val = 0
+                for b, bit in enumerate(chunk):
+                    if bit:
+                        byte_val |= 1 << (7 - b)
+                packed[i, j // bits] = byte_val
+        layer.packed_weight = packed
+        layer.scale = module.weight.detach().abs().mean(dim=1, keepdim=True)
         return layer
 
     def forward(self, x):
@@ -128,15 +148,19 @@ class _BinarizeLinear(nn.Module):
         return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
 
     def _forward_cpu(self, x):
-        import numpy as _np
+        if self.packed_weight.dtype != torch.uint8:
+            return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
+        import numpy as np
         x_np = x.detach().cpu().numpy()
-        if x_np.dtype != _np.float32:
-            x_np = x_np.astype(_np.float32)
-        x_bin = (x_np > 0).astype(_np.uint8)
+        x_bin = (x_np > 0).astype(np.uint8)
+        x_packed = np.packbits(x_bin, axis=-1)
         w = self.packed_weight.detach().cpu().numpy()
-        matches = _np.count_nonzero(x_bin[:, None, :] == w[None, :, :], axis=-1)
-        signed = matches.astype(_np.float32) * 2 - self.in_features
-        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(_np.float32)
+        xor = np.bitwise_xor(x_packed[:, None, :], w[None, :, :])
+        lookup = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
+        mismatches = lookup[xor]
+        matches = (self.in_features // 8 * 8 - mismatches.sum(axis=-1)).astype(np.float32)
+        signed = matches * 2 - self.in_features
+        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(np.float32)
         out = (signed / float(self.in_features) * s).sum(axis=-1)
         return torch.from_numpy(out).to(x)
 
@@ -315,6 +339,16 @@ class QuantizationEngine:
                 from transformers import AutoModel
                 return AutoModel.from_pretrained(source.path)
             else:
+                if source.path and Path(source.path).exists():
+                    if source.path.lower().endswith((".safetensors", ".safetensor", ".st")) or Path(source.path).stat().st_size > 200 * 1024 * 1024:
+                        try:
+                            from safetensors.torch import load_file
+                            state = load_file(source.path, device=str(self._device))
+                            loaded = torch.nn.Linear(1, 1)
+                            loaded.load_state_dict(state, strict=False)
+                            return loaded
+                        except Exception:
+                            pass
                 import torch
                 try:
                     return torch.load(source.path, map_location=self._device, weights_only=False)
@@ -336,7 +370,8 @@ class QuantizationEngine:
         output_path = output_dir / f"model.{fmt.value}"
 
         model_size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)
-        orig_est_mb = model_size_mb * 8
+        orig_est_mb = model_size_mb
+        quant_est_mb = model_size_mb / 8 if self.config.algorithm in {"xnor", "binarize", "binarynet", "bilevel"} else model_size_mb
 
         if fmt == QuantizationFormat.PYTORCH:
             model.eval()
@@ -376,6 +411,18 @@ class QuantizationEngine:
             },
         )
 
+    def _quantize_tensor_1bit(self, tensor: torch.Tensor) -> torch.Tensor:
+        w = tensor.detach().cpu().sign() > 0
+        packed = torch.zeros(tensor.numel() // 8 + (tensor.numel() % 8 > 0), dtype=torch.uint8)
+        flat = w.flatten()
+        for i in range(0, len(flat), 8):
+            byte_val = 0
+            for j in range(8):
+                if i + j < len(flat) and flat[i + j]:
+                    byte_val |= 1 << j
+            packed[i // 8] = byte_val
+        return packed
+
     def _quantize_tensor_4bit(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
         """Min-max quantization to 4-bit unsigned."""
         t_min = float(tensor.min().item())
@@ -394,11 +441,15 @@ class QuantizationEngine:
 
         writer = GGUFWriter(str(path), "llama")
         state = model.state_dict()
+        use_1bit = self.config.algorithm in {"xnor", "binarize", "binarynet", "bilevel"}
 
         for name, param in state.items():
             tensor = param.detach().cpu()
-            if tensor.numel() > 1000 and tensor.ndim >= 2:
-                q, t_min, scale = self._quantize_tensor_4bit(tensor)
+            if use_1bit and tensor.numel() > 1000 and tensor.ndim >= 2:
+                q = self._quantize_tensor_1bit(tensor)
+                writer.add_tensor(name, q.numpy())
+            elif tensor.numel() > 1000 and tensor.ndim >= 2:
+                q, _t_min, _scale = self._quantize_tensor_4bit(tensor)
                 writer.add_tensor(name, q.numpy())
             else:
                 writer.add_tensor(name, tensor.numpy())

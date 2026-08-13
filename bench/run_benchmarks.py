@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -29,31 +29,48 @@ class TinyMLP(nn.Module):
         return self.net(x)
 
 
+class MediumMLP(nn.Module):
+    def __init__(self, in_dim: int = 512, hidden: int = 1024, out_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 @dataclass
 class BenchmarkResult:
     name: str
+    model_class: str
+    parameter_count: int
     original_latency_ms: float
     quantized_latency_ms: float
     speedup: float
-    output_path: Optional[Path] = None
+    output_path: Optional[str] = None
     compression_ratio: Optional[float] = None
     layer_count: Optional[int] = None
+    original_size_mb: Optional[float] = None
+    quantized_size_mb: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "original_latency_ms": self.original_latency_ms,
-            "quantized_latency_ms": self.quantized_latency_ms,
-            "speedup": self.speedup,
-            "output_path": str(self.output_path) if self.output_path else None,
-            "compression_ratio": self.compression_ratio,
-            "layer_count": self.layer_count,
-        }
+        return asdict(self)
 
 
-def _benchmark(model: nn.Module, device: torch.device, repeats: int = 50) -> float:
+def _count_parameters(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def _benchmark(model: nn.Module, device: torch.device, repeats: int = 50, input_dim: int = 128) -> float:
     model.eval()
-    x = torch.randn(1, 128, device=device)
+    x = torch.randn(1, input_dim, device=device)
     with torch.no_grad():
         for _ in range(5):
             model(x)
@@ -63,49 +80,61 @@ def _benchmark(model: nn.Module, device: torch.device, repeats: int = 50) -> flo
         return (time.perf_counter() - start) / repeats * 1000.0
 
 
-def run_algorithm(name: str, algorithm: str, fmt: QuantizationFormat = QuantizationFormat.PYTORCH) -> BenchmarkResult:
-    device = Device.AUTO
-    if device == Device.AUTO:
-        d = torch.device("cpu")
-    else:
-        d = torch.device(device.value)
-
-    model = TinyMLP().to(d)
-    original_latency = _benchmark(model, d)
+def run_algorithm(name: str, algorithm: str, model_cls, input_dim: int, fmt: QuantizationFormat = QuantizationFormat.PYTORCH) -> BenchmarkResult:
+    device = torch.device("cpu")
+    model = model_cls().to(device)
+    param_count = _count_parameters(model)
+    original_latency = _benchmark(model, device, input_dim=input_dim)
 
     config = QuantizationConfig(algorithm=algorithm, granularity="per_channel", format=fmt)
     engine = QuantizationEngine(config)
     qm, stats = engine.quantize_model(model)
-    result = engine._export(qm, stats, type("Src", (), {"is_local": True, "path": None, "repo_id": None})())
-    qm.to(d)
-    quantized_latency = _benchmark(qm, d)
+
+    src = type("Src", (), {"is_local": True, "path": None, "repo_id": None})()
+    result = engine._export(qm, stats, src)
+    qm.to(device)
+    quantized_latency = _benchmark(qm, device, input_dim=input_dim)
 
     return BenchmarkResult(
         name=name,
+        model_class=model_cls.__name__,
+        parameter_count=param_count,
         original_latency_ms=original_latency,
         quantized_latency_ms=quantized_latency,
         speedup=original_latency / max(1e-6, quantized_latency),
-        output_path=result.output_path,
+        output_path=str(result.output_path),
         compression_ratio=result.compression_ratio,
         layer_count=result.layer_count,
+        original_size_mb=result.original_size_mb,
+        quantized_size_mb=result.quantized_size_mb,
     )
 
 
 def main() -> int:
-    algorithms = ["adaptive", "irnet", "xnor", "binarize"]
+    cases = [
+        ("tiny-adaptive", "adaptive", TinyMLP, 128),
+        ("tiny-irnet", "irnet", TinyMLP, 128),
+        ("tiny-xnor", "xnor", TinyMLP, 128),
+        ("tiny-binarize", "binarize", TinyMLP, 128),
+        ("medium-adaptive", "adaptive", MediumMLP, 512),
+        ("medium-irnet", "irnet", MediumMLP, 512),
+        ("medium-xnor", "xnor", MediumMLP, 512),
+        ("medium-binarize", "binarize", MediumMLP, 512),
+    ]
+
     results: List[BenchmarkResult] = []
-    for alg in algorithms:
+    for name, algorithm, model_cls, input_dim in cases:
         try:
-            res = run_algorithm(alg, alg)
+            res = run_algorithm(name, algorithm, model_cls, input_dim)
             results.append(res)
-            print(f"[bench] {alg}: orig={res.original_latency_ms:.3f}ms quant={res.quantized_latency_ms:.3f}ms speedup={res.speedup:.2f}x")
+            print(f"[bench] {name}: params={res.parameter_count:,} orig={res.original_latency_ms:.3f}ms quant={res.quantized_latency_ms:.3f}ms speedup={res.speedup:.2f}x compression={res.compression_ratio:.2f}x")
         except Exception as exc:
-            print(f"[bench] {alg}: {exc}")
+            print(f"[bench] {name}: {exc}")
 
     out_path = Path("output") / "benchmark.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps([r.to_dict() for r in results], indent=2))
-    print(f"[bench] saved to {out_path}")
+    print(f"[bench] saved {len(results)} results to {out_path}")
     return 0
 
 
