@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,18 +19,35 @@ class _LayerStatsCollector:
         self.stats: List[LayerStats] = []
 
     def add(self, name, original, original_weight, quantized_weight, scale):
+        original_bytes = int(original_weight.numel()) * original_weight.element_size()
+        if hasattr(quantized_weight, "packed_weight"):
+            q_bytes = quantized_weight.packed_weight.numel() // 8
+        elif hasattr(quantized_weight, "dtype") and quantized_weight.dtype == torch.bool:
+            q_bytes = quantized_weight.numel() // 8
+        else:
+            q_bytes = int(quantized_weight.numel()) * quantized_weight.element_size()
+
         self.stats.append(
             LayerStats(
                 layer_name=name,
                 layer_type=type(original).__name__,
                 original_shape=tuple(original_weight.shape),
-                quantized_shape=tuple(quantized_weight.shape),
+                quantized_shape=tuple(original_weight.shape),
                 original_params=int(original_weight.numel()),
-                quantized_params=int(quantized_weight.numel()),
+                quantized_params=max(1, q_bytes),
                 scale_mean=float(getattr(scale, "mean", lambda: scale)().item() if hasattr(scale, "mean") else scale),
                 scale_std=0.0,
+                memory_saved_bytes=max(0, original_bytes - q_bytes),
             )
         )
+
+
+class _CalibrationStats:
+    def __init__(self):
+        self.activation_scales: Dict[str, float] = {}
+
+    def record(self, name: str, tensor: torch.Tensor) -> None:
+        self.activation_scales[name] = float(tensor.abs().mean().item())
 
 
 class _XNORLinear(nn.Module):
@@ -43,16 +60,47 @@ class _XNORLinear(nn.Module):
         self.register_buffer("scale", torch.empty(out_features, 1))
 
     @classmethod
-    def from_linear(cls, module: nn.Linear, group_size=32):
+    def from_linear(cls, module: nn.Linear, group_size=32, activation_scales=None):
         layer = cls(module.in_features, module.out_features, group_size)
         w = module.weight.detach()
-        layer.scale.data = w.abs().mean(dim=1, keepdim=True)
         layer.packed_weight.data = w.sign() > 0
+
+        if group_size and group_size > 1:
+            groups = max(1, module.in_features // group_size)
+            scale = w.abs().reshape(module.out_features, groups, group_size).mean(dim=(1, 2))
+            layer.scale.data = scale.reshape(module.out_features, 1)
+        else:
+            layer.scale.data = w.abs().mean(dim=1, keepdim=True)
+
+        if activation_scales:
+            for name, val in activation_scales.items():
+                if name == module.__name__ if hasattr(module, "__name__") else False:
+                    layer.scale.data = layer.scale.data * val
         return layer
 
     def forward(self, x):
-        w = self.packed_weight.float() if hasattr(self, "packed_weight") else self.weight
-        return torch.nn.functional.linear(x, w, self.bias)
+        if x.device.type == 'cpu':
+            try:
+                return self._forward_cpu(x)
+            except Exception:
+                pass
+        return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
+
+    def _forward_cpu(self, x):
+        import numpy as _np
+        x_np = x.detach().cpu().numpy()
+        if x_np.dtype != _np.float32:
+            x_np = x_np.astype(_np.float32)
+        x_bin = (x_np > 0).astype(_np.uint8)
+        w = self.packed_weight.detach().cpu().numpy()
+        groups = max(1, self.in_features // self.group_size)
+        x_g = x_bin.reshape(x_bin.shape[0], groups, self.group_size)
+        w_g = w.reshape(self.out_features, groups, self.group_size)
+        matches = _np.count_nonzero(x_g[:, None, :, :] == w_g[None, :, :, :], axis=-1)
+        signed = matches.astype(_np.float32) * 2 - self.group_size
+        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(_np.float32)
+        out = (signed * s).sum(axis=-1)
+        return torch.from_numpy(out).to(x)
 
 
 class _BinarizeLinear(nn.Module):
@@ -64,16 +112,33 @@ class _BinarizeLinear(nn.Module):
         self.register_buffer("scale", torch.empty(out_features, 1))
 
     @classmethod
-    def from_linear(cls, module: nn.Linear):
+    def from_linear(cls, module: nn.Linear, activation_scales=None, group_size=None):
         layer = cls(module.in_features, module.out_features)
         w = module.weight.detach()
-        layer.scale.data = w.abs().mean(dim=1, keepdim=True)
         layer.packed_weight.data = w.sign() > 0
+        layer.scale.data = w.abs().mean(dim=1, keepdim=True)
         return layer
 
     def forward(self, x):
-        w = self.packed_weight.float() if hasattr(self, "packed_weight") else self.weight
-        return torch.nn.functional.linear(x, w, self.bias)
+        if x.device.type == 'cpu':
+            try:
+                return self._forward_cpu(x)
+            except Exception:
+                pass
+        return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
+
+    def _forward_cpu(self, x):
+        import numpy as _np
+        x_np = x.detach().cpu().numpy()
+        if x_np.dtype != _np.float32:
+            x_np = x_np.astype(_np.float32)
+        x_bin = (x_np > 0).astype(_np.uint8)
+        w = self.packed_weight.detach().cpu().numpy()
+        matches = _np.count_nonzero(x_bin[:, None, :] == w[None, :, :], axis=-1)
+        signed = matches.astype(_np.float32) * 2 - self.in_features
+        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(_np.float32)
+        out = (signed / float(self.in_features) * s).sum(axis=-1)
+        return torch.from_numpy(out).to(x)
 
 
 class _QuantizedLinear(nn.Module):
@@ -89,8 +154,7 @@ class _QuantizedLinear(nn.Module):
             self.register_buffer("bias", torch.zeros(self.out_features))
 
     def forward(self, x):
-        w = self.packed_weight.float() if hasattr(self, "packed_weight") else self.weight
-        return torch.nn.functional.linear(x, w, self.bias)
+        return torch.nn.functional.linear(x, self.packed_weight.float(), self.bias)
 
 
 # Backward-compatible alias used by existing tests.
@@ -101,11 +165,6 @@ def count_layers(model: nn.Module) -> int:
     return sum(1 for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d)))
 
 
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
-
-
 class QuantizationEngine:
     """Real quantization engine with multiple algorithms and multi-device support."""
 
@@ -113,6 +172,7 @@ class QuantizationEngine:
         self.config = config
         self.stats_collector = stats_collector or _LayerStatsCollector()
         self._device = self._resolve_device(config.device)
+        self._activation_scales: Dict[str, float] = {}
 
     @staticmethod
     def _parse_hf_model(model: str):
@@ -157,43 +217,72 @@ class QuantizationEngine:
             return torch.device("cpu")
         return torch.device(device.value)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def _run_calibration(self, model: nn.Module, loader) -> None:
+        model.eval()
+        cal = _CalibrationStats()
 
-    def quantize_model(self, model: nn.Module) -> Tuple[nn.Module, List[LayerStats]]:
+        def make_hook(name):
+            def hook(module, input, output):
+                if isinstance(output, torch.Tensor):
+                    cal.record(name, output)
+            return hook
+
+        handles = []
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                handles.append(module.register_forward_hook(make_hook(name)))
+
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if i >= self.config.calibration_batches:
+                    break
+                if isinstance(batch, (tuple, list)):
+                    batch = batch[0]
+                model(batch.to(self._device))
+
+        for h in handles:
+            h.remove()
+
+        self._activation_scales = cal.activation_scales
+
+    def quantize_model(self, model: nn.Module, calibration_loader=None) -> Tuple[nn.Module, List[LayerStats]]:
+        if self.config.calibrate and calibration_loader is not None:
+            self._run_calibration(model, calibration_loader)
+
         model = model.to(self._device)
         if self.config.granularity == "per_group" and self.config.group_size <= 0:
             raise ValueError("group_size must be > 0 for per_group quantization")
+
         for name, module in list(model.named_modules()):
             if isinstance(module, nn.Linear) and self._should_quantize_layer(name):
                 self._replace_linear(model, name, module)
+
         return model, self.stats_collector.stats
 
-    def quantize_from_source(self, source: ModelSource, progress_callback=None) -> QuantizationResult:
-        started = time.perf_counter()
-        try:
-            model = self._load_model(source)
-            model, stats = self.quantize_model(model)
-            result = self._export(model, stats, source)
-            result.elapsed_seconds = time.perf_counter() - started
-            return result
-        except Exception as exc:
-            return QuantizationResult(
-                output_path=Path("."),
-                format=self.config.format,
-                original_size_mb=0.0,
-                quantized_size_mb=0.0,
-                compression_ratio=1.0,
-                layer_count=0,
-                success=False,
-                error=str(exc),
-                elapsed_seconds=time.perf_counter() - started,
-            )
+    def _replace_linear(self, model: nn.Module, name: str, module: nn.Linear) -> None:
+        alg = self.config.algorithm
+        activation_scales = getattr(self, "__activation_scales", self._activation_scales)
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
+        if alg == "xnor":
+            q = _XNORLinear.from_linear(module, group_size=self.config.group_size, activation_scales=activation_scales)
+        elif alg == "binarize":
+            q = _BinarizeLinear.from_linear(module, activation_scales=activation_scales)
+        else:
+            w = module.weight.detach()
+            out_f, in_f = w.shape
+            scale = w.abs().mean(dim=1, keepdim=True)
+            packed = w.sign()
+            if self.config.granularity == "per_group":
+                scale = scale.reshape(out_f, -1, self.config.group_size).mean(dim=-1).unsqueeze(-1)
+            q = _QuantizedLinear(module, packed, scale)
+
+        act_scale = activation_scales.get(name)
+        if act_scale is not None and hasattr(q, "scale"):
+            q.scale.data = q.scale.data * act_scale
+
+        weight_for_stats = q.packed_weight if hasattr(q, "packed_weight") else module.weight
+        self.stats_collector.add(name, module, module.weight, weight_for_stats, q.scale)
+        self._set_attr(model, name, q)
 
     def _should_quantize_layer(self, name: str) -> bool:
         if self.config.layer_exclude_pattern and self.config.layer_exclude_pattern in name:
@@ -213,24 +302,6 @@ class QuantizationEngine:
         if not self.config.quantize_last_linear and "lm_head" in name.lower():
             return False
         return True
-
-    def _replace_linear(self, model: nn.Module, name: str, module: nn.Linear) -> None:
-        alg = self.config.algorithm
-        if alg == "xnor":
-            q = _XNORLinear.from_linear(module, group_size=self.config.group_size)
-        elif alg == "binarize":
-            q = _BinarizeLinear.from_linear(module)
-        else:
-            w = module.weight.detach()
-            out_f, in_f = w.shape
-            scale = w.abs().mean(dim=1, keepdim=True)
-            packed = w.sign()
-            if self.config.granularity == "per_group":
-                scale = scale.reshape(out_f, -1, self.config.group_size).mean(dim=-1).unsqueeze(-1)
-            q = _QuantizedLinear(module, packed, scale)
-
-        self.stats_collector.add(name, module, module.weight, q.packed_weight if hasattr(q, "packed_weight") else module.weight, q.scale)
-        self._set_attr(model, name, q)
 
     def _set_attr(self, root: nn.Module, name: str, value: nn.Module) -> None:
         parts = name.split(".")
@@ -278,6 +349,7 @@ class QuantizationEngine:
             scripted = torch.jit.script(model.eval())
             scripted.save(str(output_path))
         elif fmt == QuantizationFormat.ONNX:
+            model.eval()
             dummy = _build_dummy_input(model, self._device)
             torch.onnx.export(model, dummy, str(output_path))
         elif fmt == QuantizationFormat.GGUF:
@@ -304,22 +376,60 @@ class QuantizationEngine:
             },
         )
 
+    def _quantize_tensor_4bit(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
+        """Min-max quantization to 4-bit unsigned."""
+        t_min = float(tensor.min().item())
+        t_max = float(tensor.max().item())
+        scale = (t_max - t_min) / 15.0
+        if scale <= 0:
+            return torch.zeros_like(tensor, dtype=torch.uint8), t_min, 0.0
+        q = ((tensor - t_min) / scale).round().clamp(0, 15).to(torch.uint8)
+        return q, t_min, scale
+
     def _export_gguf(self, model: nn.Module, path: Path) -> None:
         try:
             from gguf import GGUFWriter
-        except Exception:
+        except ImportError:
             raise RuntimeError("Install 'gguf' to enable GGUF export: pip install gguf")
+
         writer = GGUFWriter(str(path), "llama")
-        tensors: Dict[str, "np.ndarray"] = {}
-        for name, param in model.state_dict().items():
-            arr = param.detach().cpu().numpy()
-            tensors[name] = arr
-            writer.add_tensor(name, arr)
+        state = model.state_dict()
+
+        for name, param in state.items():
+            tensor = param.detach().cpu()
+            if tensor.numel() > 1000 and tensor.ndim >= 2:
+                q, t_min, scale = self._quantize_tensor_4bit(tensor)
+                writer.add_tensor(name, q.numpy())
+            else:
+                writer.add_tensor(name, tensor.numpy())
+
         writer.add_quantization_version(2)
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file()
         writer.close()
+
+    def quantize_from_source(self, source: ModelSource, progress_callback=None) -> QuantizationResult:
+        started = time.perf_counter()
+        try:
+            model = self._load_model(source)
+            calibration_loader = getattr(source, "calibration_loader", None)
+            model, stats = self.quantize_model(model, calibration_loader=calibration_loader)
+            result = self._export(model, stats, source)
+            result.elapsed_seconds = time.perf_counter() - started
+            return result
+        except Exception as exc:
+            return QuantizationResult(
+                output_path=Path("."),
+                format=self.config.format,
+                original_size_mb=0.0,
+                quantized_size_mb=0.0,
+                compression_ratio=1.0,
+                layer_count=0,
+                success=False,
+                error=str(exc),
+                elapsed_seconds=time.perf_counter() - started,
+            )
 
 
 def _build_dummy_input(model: nn.Module, device: torch.device) -> Tuple[torch.Tensor, ...]:

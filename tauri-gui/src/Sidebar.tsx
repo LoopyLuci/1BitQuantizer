@@ -24,15 +24,17 @@ interface SidebarProps {
   layerExclude: string;
   running: boolean;
   apiReady: boolean;
+  currentJobId: string;
   onQuantize: () => void;
   onBrowse: () => void;
+  onCancel: () => void;
   onChange: (patch: Record<string, any>) => void;
 }
 
 export function Sidebar({
   sourceType, modelPath, repoId, revision, algorithm, granularity, groupSize,
   calibrate, quantizeEmbeddings, quantizeFinalNorm, quantizeBias, optimizeInference,
-  format, target, device, layerInclude, layerExclude, running, apiReady, onQuantize, onBrowse, onChange
+  format, target, device, layerInclude, layerExclude, running, apiReady, currentJobId, onQuantize, onBrowse, onCancel, onChange
 }: SidebarProps) {
   const input = (name: string, props: any = {}) => (
     <input
@@ -139,13 +141,21 @@ export function Sidebar({
       </section>
 
       <button onClick={onQuantize} disabled={running || !apiReady} style={{
-        width: '100%', padding: 14, borderRadius: 8, border: 'none',
-        background: running || !apiReady ? '#475569' : 'linear-gradient(135deg,#6366f1,#a855f7)',
-        color: 'white', fontWeight: 700, cursor: running || !apiReady ? 'not-allowed' : 'pointer',
-        opacity: running || !apiReady ? 0.7 : 1,
+        width:'100%',padding:14,borderRadius:8,border:'none',
+        background:running||!apiReady?'#475569':'linear-gradient(135deg,#6366f1,#a855f7)',
+        color:'white',fontWeight:700,cursor:running||!apiReady?'not-allowed':'pointer',
+        opacity:running||!apiReady?.7:1
       }}>
         {running ? '⏳ Quantizing...' : '⚡ Quantize Model'}
       </button>
+      {running && (
+        <button onClick={onCancel} style={{
+          width:'100%',marginTop:10,padding:10,borderRadius:8,border:'1px solid #f87171',
+          background:'transparent',color:'#f87171',fontWeight:600,cursor:'pointer'
+        }}>
+          Cancel
+        </button>
+      )}
     </aside>
   );
 }
