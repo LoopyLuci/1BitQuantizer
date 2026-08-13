@@ -93,22 +93,16 @@ class _XNORLinear(nn.Module):
     def _forward_cpu(self, x):
         if self.packed_weight.dtype != torch.uint8:
             return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
-        import numpy as np
-        x_np = x.detach().cpu().numpy()
-        x_bin = (x_np > 0).astype(np.uint8)
-        x_packed = np.packbits(x_bin, axis=-1)
-        w = self.packed_weight.detach().cpu().numpy()
+        w = self.packed_weight.to(x.device)
         groups = max(1, self.in_features // self.group_size)
-        x_packed = x_packed.reshape(x_bin.shape[0], groups, self.group_size // 8)
-        w = w.reshape(self.out_features, groups, self.group_size // 8)
-        xor = np.bitwise_xor(x_packed[:, None, :, :], w[None, :, :, :])
-        lookup = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
-        mismatches = lookup[xor]
-        matches = (self.group_size - mismatches.sum(axis=-1)).astype(np.float32)
+        x_bin = (x > 0).to(w.dtype)
+        x_packed = torch.packbits(x_bin.unsqueeze(-1), dim=-1).squeeze(-1)
+        x_packed = x_packed.reshape(x.shape[0], groups, self.group_size // 8)
+        w = w.reshape(1, self.out_features, groups, self.group_size // 8)
+        xor = torch.bitwise_xor(x_packed.unsqueeze(2), w)
+        matches = self.group_size - xor.sum(dim=-1)
         signed = matches * 2 - self.group_size
-        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(np.float32)
-        out = (signed * s).sum(axis=-1)
-        return torch.from_numpy(out).to(x)
+        return (signed * self.scale.t().reshape(1, self.out_features, 1)).sum(dim=-1)
 
 
 class _BinarizeLinear(nn.Module):
@@ -150,19 +144,14 @@ class _BinarizeLinear(nn.Module):
     def _forward_cpu(self, x):
         if self.packed_weight.dtype != torch.uint8:
             return torch.nn.functional.linear(x, self.packed_weight.float(), self.scale.t().flatten() if self.scale.ndim == 2 else self.scale.flatten())
-        import numpy as np
-        x_np = x.detach().cpu().numpy()
-        x_bin = (x_np > 0).astype(np.uint8)
-        x_packed = np.packbits(x_bin, axis=-1)
-        w = self.packed_weight.detach().cpu().numpy()
-        xor = np.bitwise_xor(x_packed[:, None, :], w[None, :, :])
-        lookup = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
-        mismatches = lookup[xor]
-        matches = (self.in_features // 8 * 8 - mismatches.sum(axis=-1)).astype(np.float32)
+        w = self.packed_weight.to(x.device)
+        x_bin = (x > 0).to(w.dtype)
+        x_packed = torch.packbits(x_bin.unsqueeze(-1), dim=-1).squeeze(-1)
+        xor = torch.bitwise_xor(x_packed.unsqueeze(2), w.unsqueeze(0))
+        mismatches = xor.sum(dim=-1)
+        matches = (self.in_features - mismatches)
         signed = matches * 2 - self.in_features
-        s = self.scale.detach().cpu().numpy().reshape(1, self.out_features, 1).astype(np.float32)
-        out = (signed / float(self.in_features) * s).sum(axis=-1)
-        return torch.from_numpy(out).to(x)
+        return (signed / float(self.in_features) * self.scale.t().reshape(1, self.out_features, 1)).sum(dim=-1)
 
 
 class _QuantizedLinear(nn.Module):
